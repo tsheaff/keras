@@ -15,13 +15,15 @@
 # ==============================================================================
 """Tests for ClusterCoordinator and Keras models."""
 
+from absl.testing import parameterized
+
 import keras
 from keras.distribute import multi_worker_testing_utils
 from keras.engine import base_layer
 import tensorflow.compat.v2 as tf
 
 
-class ShardedVariableTest(tf.test.TestCase):
+class ShardedVariableTest(tf.test.TestCase, parameterized.TestCase):
 
   @classmethod
   def setUpClass(cls):
@@ -132,31 +134,70 @@ class ShardedVariableTest(tf.test.TestCase):
     self.assertTrue(hasattr(auc.true_positives, 'variables'))
     self.assertTrue(hasattr(fp.accumulator, 'variables'))
 
-  def test_saved_model(self):
+  @tf.__internal__.distribute.combinations.generate(
+      tf.__internal__.test.combinations.combine(
+          shard_config=[[2, 2], [2, 3], [3, 2], [2, 1], [1, 1], [1, 2], [1, 3]],
+          model_type=['dense', 'embedding'],
+          ))
+  def test_saved_model_combined(self, shard_config, model_type):
 
-    def create_model():
-      inputs = keras.layers.Input(shape=(4,))
-      outputs = keras.layers.Dense(2)(inputs)
+    def create_embedding_model():
+      inputs = keras.layers.Input(shape=(6,))
+      embedding = keras.layers.Embedding(output_dim=2, input_dim=6)
+      outputs = embedding(inputs)
       model = keras.Model(inputs, outputs)
       model.compile(optimizer='adam', loss='mean_squared_error')
       return model
 
-    with self.strategy.scope():
-      model = create_model()
+    def create_dense_model():
+      inputs = keras.layers.Input(shape=(6,))
+      outputs = keras.layers.Dense(6)(inputs)
+      model = keras.Model(inputs, outputs)
+      model.compile(optimizer='adam', loss='mean_squared_error')
+      return model
 
-    inputs = tf.random.normal(shape=(8, 4))
-    expect = model(inputs)
+    # Maybe create new strategy with different number of shards
+    if shard_config[0] != 2:
+      strategy = tf.distribute.experimental.ParameterServerStrategy(
+          multi_worker_testing_utils.make_parameter_server_cluster(3, 3),
+          variable_partitioner=tf.distribute.experimental.partitioners
+          .FixedShardsPartitioner(shard_config[0]))
+    elif shard_config[0] == 1:
+      strategy = tf.distribute.get_strategy()
+    else:
+      strategy = self.strategy
+
+    x = tf.cast(tf.expand_dims(tf.range(6), 0), tf.float32)
+    with strategy.scope():
+      model = (create_dense_model() if model_type == 'dense'
+               else create_embedding_model())
+      expect = model(x)
+
+    # Dense layers have two variables (kernel and bias), embedding layers have 1
+    n_expected_variables = shard_config[0] * (2 if model_type == 'dense' else 1)
+    self.assertLen(model.variables, n_expected_variables)
+
     saved_dir = self.get_temp_dir()
     model.save(saved_dir)
 
-    loaded_model = keras.models.load_model(saved_dir)
-    got = loaded_model(inputs)
-    self.assertAllClose(got, expect)
-    self.assertGreater(len(model.variables), len(loaded_model.variables))
+    if shard_config[1] != 2:
+      strategy2 = tf.distribute.experimental.ParameterServerStrategy(
+          multi_worker_testing_utils.make_parameter_server_cluster(3, 3),
+          variable_partitioner=tf.distribute.experimental.partitioners
+          .FixedShardsPartitioner(shard_config[1]))
+    elif shard_config[1] == 1:
+      strategy2 = tf.distribute.get_strategy()
+    else:
+      strategy2 = self.strategy
+    with strategy2.scope():
+      loaded_model = keras.models.load_model(saved_dir)
+      got = loaded_model(x)
 
-    with self.assertRaises(ValueError):
-      with self.strategy.scope():
-        keras.models.load_model(saved_dir)
+      self.assertAllClose(got, expect)
+      # Should be 3 shard variables for embedding weights
+      n_expected_variables = shard_config[1] * (2
+                                                if model_type == 'dense' else 1)
+      self.assertLen(loaded_model.variables, n_expected_variables)
 
   def test_slot_variable_checkpointing(self):
 

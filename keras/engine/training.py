@@ -19,7 +19,6 @@ import itertools
 import json
 import os
 import warnings
-import weakref
 
 from keras import backend
 from keras import callbacks as callbacks_module
@@ -41,7 +40,6 @@ from keras.saving.saved_model import model_serialization
 from keras.utils import generic_utils
 from keras.utils import io_utils
 from keras.utils import layer_utils
-from keras.utils import object_identity
 from keras.utils import tf_utils
 from keras.utils import traceback_utils
 from keras.utils import version_utils
@@ -273,7 +271,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
     self._training_state = None
     self._saved_model_inputs_spec = None
     self._saved_model_arg_spec = None
-    self._trackable_saver = saver_with_op_caching(self)
+    self._checkpoint = tf.train.Checkpoint(root=self)
 
     self._steps_per_execution = None
 
@@ -2507,7 +2505,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         session = None
       else:
         session = backend.get_session()
-      self._trackable_saver.save(filepath, session=session, options=options)
+      self._checkpoint.write(filepath, session=session, options=options)
       # Record this checkpoint so it's visible from tf.train.latest_checkpoint.
       tf.__internal__.train.update_checkpoint_state(
           save_dir=os.path.dirname(filepath),
@@ -2583,7 +2581,7 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
 
     filepath, save_format = _detect_save_format(filepath)
     if save_format == 'tf':
-      status = self._trackable_saver.restore(filepath, options)
+      status = self._checkpoint.read(filepath, options)
       if by_name:
         raise NotImplementedError(
             'Weights may only be loaded based on topology into Models when '
@@ -3452,16 +3450,6 @@ def flatten_metrics_in_order(logs, metrics_names):
 def _is_per_replica_instance(obj):
   return (isinstance(obj, tf.distribute.DistributedValues) and
           isinstance(obj, tf.__internal__.CompositeTensor))
-
-
-def saver_with_op_caching(obj):
-  if tf.executing_eagerly():
-    saveables_cache = None
-  else:
-    saveables_cache = object_identity.ObjectIdentityWeakKeyDictionary()
-  return tf.__internal__.tracking.TrackableSaver(
-      tf.__internal__.tracking.ObjectGraphView(
-          weakref.ref(obj), saveables_cache=saveables_cache))
 
 
 def disable_multi_worker(method):
